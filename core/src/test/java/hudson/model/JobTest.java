@@ -1,17 +1,11 @@
 package hudson.model;
 
-
-import junit.framework.Assert;
+import static org.junit.Assert.assertEquals;
 
 import org.junit.Test;
-import org.kohsuke.stapler.StaplerRequest;
-import org.mockito.Mockito;
 
 public class JobTest {
 
-    private final String DISPLAY_NAME_PARAMETER_NAME = "displayName";
-    
-    
     @Test
     public void testSetDisplayName() throws Exception {
        final String displayName = "testSetDisplayName";
@@ -21,7 +15,7 @@ public class JobTest {
        j.setDisplayNameOrNull(displayName);
        
        // make sure the displayname has been set
-       Assert.assertEquals(displayName, j.getDisplayName());
+       assertEquals(displayName, j.getDisplayName());
     }
 
     @Test
@@ -31,6 +25,6 @@ public class JobTest {
         j.setDisplayNameOrNull("");
 
         // make sure the getDisplayName returns the project name
-        Assert.assertEquals(StubJob.DEFAULT_STUB_JOB_NAME, j.getDisplayName());
+        assertEquals(StubJob.DEFAULT_STUB_JOB_NAME, j.getDisplayName());
     }
 }

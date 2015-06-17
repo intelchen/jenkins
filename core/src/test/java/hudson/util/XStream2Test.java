@@ -23,33 +23,37 @@
  */
 package hudson.util;
 
+import static org.junit.Assert.*;
+
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
-import junit.framework.TestCase;
-import hudson.matrix.MatrixRun;
+import com.thoughtworks.xstream.XStreamException;
+import hudson.XmlFile;
 import hudson.model.Result;
 import hudson.model.Run;
-
-import org.jvnet.hudson.test.Bug;
-
-import java.io.InputStream;
+import java.io.File;
 import java.util.List;
 import java.util.Map;
-
-import jenkins.model.CauseOfInterruption;
-import jenkins.model.InterruptedBuildAction;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+import org.apache.commons.io.FileUtils;
+import org.junit.Test;
+import org.jvnet.hudson.test.Issue;
+import org.jvnet.hudson.test.Issue;
 
 /**
  * Tests for XML serialization of java objects.
  * @author Kohsuke Kawaguchi, Mike Dillon, Alan Harder, Richard Mortimer
  */
-public class XStream2Test extends TestCase {
+public class XStream2Test {
 
     public static final class Foo {
         Result r1,r2;
     }
 
-    public void testMarshalValue() {
+    @Test
+    public void marshalValue() {
         Foo f = new Foo();
         f.r1 = f.r2 = Result.FAILURE;
         String xml = Run.XSTREAM.toXML(f);
@@ -64,7 +68,8 @@ public class XStream2Test extends TestCase {
     /**
      * Test ability to read old XML from Hudson 1.105 or older.
      */
-    public void testXStream11Compatibility() {
+    @Test
+    public void xStream11Compatibility() {
         Bar b = (Bar)new XStream2().fromXML(
                 "<hudson.util.XStream2Test-Bar><s>foo</s></hudson.util.XStream2Test-Bar>");
         assertEquals("foo", b.s);
@@ -78,9 +83,10 @@ public class XStream2Test extends TestCase {
 
     /**
      * Test marshal/unmarshal round trip for class/field names with _ and $ characters.
-     * (HUDSON-5768)
      */
-    public void testXmlRoundTrip() {
+    @Issue("HUDSON-5768")
+    @Test
+    public void xmlRoundTrip() {
         XStream2 xs = new XStream2();
         __Foo_Bar$Class b = new __Foo_Bar$Class();
 
@@ -103,9 +109,12 @@ public class XStream2Test extends TestCase {
      * Verify RobustReflectionConverter can handle missing fields in a class extending
      * Throwable/Exception (default ThrowableConverter registered by XStream calls
      * ReflectionConverter directly, rather than our RobustReflectionConverter replacement).
-     * (HUDSON-5769)
      */
-    public void testUnmarshalThrowableMissingField() {
+    @Issue("HUDSON-5769")
+    @Test
+    public void unmarshalThrowableMissingField() {
+        Level oldLevel = disableLogging();
+
         Baz baz = new Baz();
         baz.myFailure = new Exception("foo");
 
@@ -123,6 +132,18 @@ public class XStream2Test extends TestCase {
                 + "</myFailure></hudson.util.XStream2Test_-Baz>");
         // Object should load, despite "missingField" in XML above
         assertEquals("hoho", baz.myFailure.getMessage());
+
+        enableLogging(oldLevel);
+    }
+
+    private Level disableLogging() {
+        Level oldLevel = Logger.getLogger(RobustReflectionConverter.class.getName()).getLevel();
+        Logger.getLogger(RobustReflectionConverter.class.getName()).setLevel(Level.OFF);
+        return oldLevel;
+    }
+
+    private void enableLogging(Level oldLevel) {
+        Logger.getLogger(RobustReflectionConverter.class.getName()).setLevel(oldLevel);
     }
 
     private static class ImmutableMapHolder {
@@ -133,7 +154,8 @@ public class XStream2Test extends TestCase {
         Map<?,?> m;
     }
 
-    public void testImmutableMap() {
+    @Test
+    public void immutableMap() {
         XStream2 xs = new XStream2();
 
         roundtripImmutableMap(xs, ImmutableMap.of());
@@ -181,7 +203,8 @@ public class XStream2Test extends TestCase {
         List<?> l;
     }
 
-    public void testImmutableList() {
+    @Test
+    public void immutableList() {
         XStream2 xs = new XStream2();
 
         roundtripImmutableList(xs, ImmutableList.of());
@@ -221,14 +244,16 @@ public class XStream2Test extends TestCase {
         assertEquals(l,a.l);
     }
 
-    @Bug(8006) // Previously a null entry in an array caused NPE
-    public void testEmptyStack() {
+    @Issue("JENKINS-8006") // Previously a null entry in an array caused NPE
+    @Test
+    public void emptyStack() {
         assertEquals("<object-array><null/><null/></object-array>",
                      Run.XSTREAM.toXML(new Object[2]).replaceAll("[ \n\r\t]+", ""));
     }
 
-    @Bug(9843)
-    public void testCompatibilityAlias() {
+    @Issue("JENKINS-9843")
+    @Test
+    public void compatibilityAlias() {
         XStream2 xs = new XStream2();
         xs.addCompatibilityAlias("legacy.Point",Point.class);
         Point pt = (Point)xs.fromXML("<legacy.Point><x>1</x><y>2</y></legacy.Point>");
@@ -243,21 +268,63 @@ public class XStream2Test extends TestCase {
         public int x,y;
     }
 
+    public static class Foo2 {
+        ConcurrentHashMap<String,String> m = new ConcurrentHashMap<String,String>();
+    }
+
     /**
-     * Unmarshall a matrix build.xml result.
+     * Tests that ConcurrentHashMap is serialized into a more compact format,
+     * but still can deserialize to older, verbose format.
      */
-    @Bug(10903)
-    public void testUnMarshalRunMatrix() {
-        InputStream is = XStream2Test.class.getResourceAsStream("runMatrix.xml");
-        MatrixRun result = (MatrixRun) Run.XSTREAM.fromXML(is);
-        assertNotNull(result);
-        assertNotNull(result.getActions());
-        assertEquals(2, result.getActions().size());
-        InterruptedBuildAction action = (InterruptedBuildAction) result.getActions().get(1);
-        assertNotNull(action.getCauses());
-        assertEquals(1, action.getCauses().size());
-        CauseOfInterruption.UserInterruption cause =
-            (CauseOfInterruption.UserInterruption) action.getCauses().get(0);
-        assertNotNull(cause);
+    @Test
+    public void concurrentHashMapSerialization() throws Exception {
+        Foo2 foo = new Foo2();
+        foo.m.put("abc","def");
+        foo.m.put("ghi","jkl");
+        File v = File.createTempFile("hashmap", "xml");
+        try {
+            new XmlFile(v).write(foo);
+
+            // should serialize like map
+            String xml = FileUtils.readFileToString(v);
+            assertFalse(xml.contains("java.util.concurrent"));
+            //System.out.println(xml);
+            Foo2 deserialized = (Foo2) new XStream2().fromXML(xml);
+            assertEquals(2,deserialized.m.size());
+            assertEquals("def", deserialized.m.get("abc"));
+            assertEquals("jkl", deserialized.m.get("ghi"));
+        } finally {
+            v.delete();
+        }
+
+        // should be able to read in old data just fine
+        Foo2 map = (Foo2) new XStream2().fromXML(getClass().getResourceAsStream("old-concurrentHashMap.xml"));
+        assertEquals(1,map.m.size());
+        assertEquals("def",map.m.get("abc"));
+    }
+
+    @Issue("SECURITY-105")
+    @Test
+    public void dynamicProxyBlocked() {
+        try {
+            ((Runnable) new XStream2().fromXML("<dynamic-proxy><interface>java.lang.Runnable</interface><handler class='java.beans.EventHandler'><target class='" + Hacked.class.getName() + "'/><action>oops</action></handler></dynamic-proxy>")).run();
+        } catch (XStreamException x) {
+            // good
+        }
+        assertFalse("should never have run that", Hacked.tripped);
+    }
+
+    public static final class Hacked {
+        static boolean tripped;
+        public void oops() {
+            tripped = true;
+        }
+    }
+
+    @Test
+    public void trimVersion() {
+        assertEquals("3.2", XStream2.trimVersion("3.2"));
+        assertEquals("3.2.1", XStream2.trimVersion("3.2.1"));
+        assertEquals("3.2-SNAPSHOT", XStream2.trimVersion("3.2-SNAPSHOT (private-09/23/2012 12:26-jhacker)"));
     }
 }

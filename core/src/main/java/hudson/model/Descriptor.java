@@ -24,11 +24,15 @@
 package hudson.model;
 
 import hudson.DescriptorExtensionList;
+import hudson.PluginWrapper;
 import hudson.RelativePath;
 import hudson.XmlFile;
 import hudson.BulkChange;
+import hudson.ExtensionList;
 import hudson.Util;
 import hudson.model.listeners.SaveableListener;
+import hudson.util.FormApply;
+import hudson.util.FormValidation.CheckMethod;
 import hudson.util.ReflectionUtils;
 import hudson.util.ReflectionUtils.Parameter;
 import hudson.views.ListViewColumn;
@@ -42,7 +46,7 @@ import org.springframework.util.StringUtils;
 import org.jvnet.tiger_types.Types;
 import org.apache.commons.io.IOUtils;
 
-import static hudson.Functions.*;
+import static hudson.util.QuotedStringTokenizer.*;
 import static javax.servlet.http.HttpServletResponse.SC_NOT_FOUND;
 import javax.servlet.ServletException;
 import javax.servlet.RequestDispatcher;
@@ -68,6 +72,8 @@ import java.lang.reflect.Type;
 import java.lang.reflect.Field;
 import java.lang.reflect.ParameterizedType;
 import java.beans.Introspector;
+import javax.annotation.CheckForNull;
+import javax.annotation.Nonnull;
 
 /**
  * Metadata about a configurable instance.
@@ -122,7 +128,7 @@ public abstract class Descriptor<T extends Describable<T>> implements Saveable {
      */
     public transient final Class<? extends T> clazz;
 
-    private transient final Map<String,String> checkMethods = new ConcurrentHashMap<String,String>();
+    private transient final Map<String,CheckMethod> checkMethods = new ConcurrentHashMap<String,CheckMethod>();
 
     /**
      * Lazily computed list of properties on {@link #clazz} and on the descriptor itself.
@@ -189,6 +195,9 @@ public abstract class Descriptor<T extends Describable<T>> implements Saveable {
 
         public Descriptor getItemTypeDescriptorOrDie() {
             Class it = getItemType();
+            if (it == null) {
+                throw new AssertionError(clazz + " is not an array/collection type in " + displayName + ". See https://wiki.jenkins-ci.org/display/JENKINS/My+class+is+missing+descriptor");
+            }
             Descriptor d = Jenkins.getInstance().getDescriptor(it);
             if (d==null)
                 throw new AssertionError(it +" is missing its descriptor in "+displayName+". See https://wiki.jenkins-ci.org/display/JENKINS/My+class+is+missing+descriptor");
@@ -196,10 +205,17 @@ public abstract class Descriptor<T extends Describable<T>> implements Saveable {
         }
 
         /**
-         * Returns all the descriptors that produce types assignable to the item type.
+         * Returns all the descriptors that produce types assignable to the property type.
          */
         public List<? extends Descriptor> getApplicableDescriptors() {
             return Jenkins.getInstance().getDescriptorList(clazz);
+        }
+
+        /**
+         * Returns all the descriptors that produce types assignable to the item type for a collection property.
+         */
+        public List<? extends Descriptor> getApplicableItemDescriptors() {
+            return Jenkins.getInstance().getDescriptorList(getItemType());
         }
     }
 
@@ -208,7 +224,22 @@ public abstract class Descriptor<T extends Describable<T>> implements Saveable {
      *
      * @see #getHelpFile(String) 
      */
-    private final Map<String,String> helpRedirect = new HashMap<String, String>();
+    private transient final Map<String,HelpRedirect> helpRedirect = new HashMap<String,HelpRedirect>();
+
+    private static class HelpRedirect {
+        private final Class<? extends Describable> owner;
+        private final String fieldNameToRedirectTo;
+
+        private HelpRedirect(Class<? extends Describable> owner, String fieldNameToRedirectTo) {
+            this.owner = owner;
+            this.fieldNameToRedirectTo = fieldNameToRedirectTo;
+        }
+
+        private String resolve() {
+            // the resolution has to be deferred to avoid ordering issue among descriptor registrations.
+            return Jenkins.getInstance().getDescriptor(owner).getHelpFile(fieldNameToRedirectTo);
+        }
+    }
 
     /**
      *
@@ -273,6 +304,9 @@ public abstract class Descriptor<T extends Describable<T>> implements Saveable {
      * but if you are adding {@link Descriptor}s programmatically for the same type, you can change
      * this to disambiguate them.
      *
+     * <p>
+     * To look up {@link Descriptor} from ID, use {@link Jenkins#getDescriptor(String)}.
+     *
      * @return
      *      Stick to valid Java identifier character, plus '.', which had to be allowed for historical reasons.
      * 
@@ -329,68 +363,28 @@ public abstract class Descriptor<T extends Describable<T>> implements Saveable {
     }
 
     /**
-     * If the field "xyz" of a {@link Describable} has the corresponding "doCheckXyz" method,
-     * return the form-field validation string. Otherwise null.
-     * <p>
-     * This method is used to hook up the form validation method to the corresponding HTML input element.
+     * @deprecated since 1.528
+     *      Use {@link #getCheckMethod(String)}
      */
+    @Deprecated
     public String getCheckUrl(String fieldName) {
-        String method = checkMethods.get(fieldName);
-        if(method==null) {
-            method = calcCheckUrl(fieldName);
-            checkMethods.put(fieldName,method);
-        }
-
-        if (method.equals(NONE)) // == would do, but it makes IDE flag a warning
-            return null;
-
-        // put this under the right contextual umbrella.
-        // a is always non-null because we already have Hudson as the sentinel
-        return '\'' + jsStringEscape(getCurrentDescriptorByNameUrl()) + "/'+" + method;
-    }
-
-    private String calcCheckUrl(String fieldName) {
-        String capitalizedFieldName = StringUtils.capitalize(fieldName);
-
-        Method method = ReflectionUtils.getPublicMethodNamed(getClass(),"doCheck"+ capitalizedFieldName);
-
-        if(method==null)
-            return NONE;
-
-        return '\'' + getDescriptorUrl() + "/check" + capitalizedFieldName + '\'' + buildParameterList(method, new StringBuilder()).append(".toString()");
+        return getCheckMethod(fieldName).toCheckUrl();
     }
 
     /**
-     * Builds query parameter line by figuring out what should be submitted
+     * If the field "xyz" of a {@link Describable} has the corresponding "doCheckXyz" method,
+     * return the model of the check method.
+     * <p>
+     * This method is used to hook up the form validation method to the corresponding HTML input element.
      */
-    private StringBuilder buildParameterList(Method method, StringBuilder query) {
-        for (Parameter p : ReflectionUtils.getParameters(method)) {
-            QueryParameter qp = p.annotation(QueryParameter.class);
-            if (qp!=null) {
-                String name = qp.value();
-                if (name.length()==0) name = p.name();
-                if (name==null || name.length()==0)
-                    continue;   // unknown parameter name. we'll report the error when the form is submitted.
-
-                RelativePath rp = p.annotation(RelativePath.class);
-                if (rp!=null)
-                    name = rp.value()+'/'+name;
-
-                if (query.length()==0)  query.append("+qs(this)");
-
-                if (name.equals("value")) {
-                    // The special 'value' parameter binds to the the current field
-                    query.append(".addThis()");
-                } else {
-                    query.append(".nearBy('"+name+"')");
-                }
-                continue;
-            }
-
-            Method m = ReflectionUtils.getPublicMethodNamed(p.type(), "fromStapler");
-            if (m!=null)    buildParameterList(m,query);
+    public CheckMethod getCheckMethod(String fieldName) {
+        CheckMethod method = checkMethods.get(fieldName);
+        if(method==null) {
+            method = new CheckMethod(this,fieldName);
+            checkMethods.put(fieldName,method);
         }
-        return query;
+
+        return method;
     }
 
     /**
@@ -453,9 +447,25 @@ public abstract class Descriptor<T extends Describable<T>> implements Saveable {
     /**
      * Used by Jelly to abstract away the handlign of global.jelly vs config.jelly databinding difference.
      */
-    public PropertyType getPropertyType(Object instance, String field) {
+    public @CheckForNull PropertyType getPropertyType(@Nonnull Object instance, @Nonnull String field) {
         // in global.jelly, instance==descriptor
         return instance==this ? getGlobalPropertyType(field) : getPropertyType(field);
+    }
+
+    /**
+     * Akin to {@link #getPropertyType(Object,String)} but never returns null.
+     * @throws AssertionError in case the field cannot be found
+     * @since 1.492
+     */
+    public @Nonnull PropertyType getPropertyTypeOrDie(@Nonnull Object instance, @Nonnull String field) {
+        PropertyType propertyType = getPropertyType(instance, field);
+        if (propertyType != null) {
+            return propertyType;
+        } else if (instance == this) {
+            throw new AssertionError(getClass().getName() + " has no property " + field);
+        } else {
+            throw new AssertionError(clazz.getName() + " has no property " + field);
+        }
     }
 
     /**
@@ -503,6 +513,7 @@ public abstract class Descriptor<T extends Describable<T>> implements Saveable {
      *      Implement {@link #newInstance(StaplerRequest, JSONObject)} method instead.
      *      Deprecated as of 1.145. 
      */
+    @Deprecated
     public T newInstance(StaplerRequest req) throws FormException {
         throw new UnsupportedOperationException(getClass()+" should implement newInstance(StaplerRequest,JSONObject)");
     }
@@ -623,8 +634,8 @@ public abstract class Descriptor<T extends Describable<T>> implements Saveable {
     }
 
     public String getHelpFile(Klass<?> clazz, String fieldName) {
-        String v = helpRedirect.get(fieldName);
-        if (v!=null)    return v;
+        HelpRedirect r = helpRedirect.get(fieldName);
+        if (r!=null)    return r.resolve();
 
         for (Klass<?> c : clazz.getAncestors()) {
             String page = "/descriptor/" + getId() + "/help";
@@ -654,8 +665,7 @@ public abstract class Descriptor<T extends Describable<T>> implements Saveable {
      * @since 1.425
      */
     protected void addHelpFileRedirect(String fieldName, Class<? extends Describable> owner, String fieldNameToRedirectTo) {
-        helpRedirect.put(fieldName,
-            Jenkins.getInstance().getDescriptor(owner).getHelpFile(fieldNameToRedirectTo));
+        helpRedirect.put(fieldName, new HelpRedirect(owner,fieldNameToRedirectTo));
     }
 
     /**
@@ -676,6 +686,7 @@ public abstract class Descriptor<T extends Describable<T>> implements Saveable {
      * @deprecated
      *      As of 1.239, use {@link #configure(StaplerRequest, JSONObject)}.
      */
+    @Deprecated
     public boolean configure( StaplerRequest req ) throws FormException {
         return true;
     }
@@ -775,8 +786,18 @@ public abstract class Descriptor<T extends Describable<T>> implements Saveable {
         }
     }
 
-    private XmlFile getConfigFile() {
+    protected XmlFile getConfigFile() {
         return new XmlFile(new File(Jenkins.getInstance().getRootDir(),getId()+".xml"));
+    }
+
+    /**
+     * Returns the plugin in which this descriptor is defined.
+     *
+     * @return
+     *      null to indicate that this descriptor came from the core.
+     */
+    protected PluginWrapper getPlugin() {
+        return Jenkins.getInstance().getPluginManager().whichPlugin(clazz);
     }
 
     /**
@@ -787,6 +808,14 @@ public abstract class Descriptor<T extends Describable<T>> implements Saveable {
         if(path.contains("..")) throw new ServletException("Illegal path: "+path);
 
         path = path.replace('/','-');
+
+        PluginWrapper pw = getPlugin();
+        if (pw!=null) {
+            rsp.setHeader("X-Plugin-Short-Name",pw.getShortName());
+            rsp.setHeader("X-Plugin-Long-Name",pw.getLongName());
+            rsp.setHeader("X-Plugin-From", Messages.Descriptor_From(
+                    pw.getLongName().replace("Hudson","Jenkins").replace("hudson","jenkins"), pw.getUrl()));
+        }
 
         for (Klass<?> c= getKlass(); c!=null; c=c.getSuperClass()) {
             RequestDispatcher rd = Stapler.getCurrentRequest().getView(c, "help"+path);
@@ -883,8 +912,36 @@ public abstract class Descriptor<T extends Describable<T>> implements Saveable {
         if (formData!=null) {
             for (Object o : JSONArray.fromObject(formData)) {
                 JSONObject jo = (JSONObject)o;
-                String kind = jo.getString("kind");
-                items.add(find(descriptors,kind).newInstance(req,jo));
+                Descriptor<T> d = null;
+                // 'kind' and '$class' are mutually exclusive (see class-entry.jelly), but to be more lenient on the reader side,
+                // we check them both anyway. 'kind' (which maps to ID) is more unique than '$class', which can have multiple matching
+                // Descriptors, so we prefer 'kind' if it's present.
+                String kind = jo.optString("kind", null);
+                if (kind != null) {
+                    // Only applies when Descriptor.getId is overridden.
+                    // Note that kind is only supported here,
+                    // *not* inside the StaplerRequest.bindJSON which is normally called by newInstance
+                    // (since Descriptor.newInstance is not itself available to Stapler).
+                    // If you merely override getId for some reason, but use @DataBoundConstructor on your Describable,
+                    // there is no problem; but you can only rely on newInstance being called at top level.
+                    d = findById(descriptors, kind);
+                }
+                if (d == null) {
+                  kind = jo.optString("$class");
+                  if (kind != null) { // else we will fall through to the warning
+                      // This is the normal case.
+                      d = findByDescribableClassName(descriptors, kind);
+                      if (d == null) {
+                          // Deprecated system where stapler-class was the Descriptor class name (rather than Describable class name).
+                          d = findByClassName(descriptors, kind);
+                      }
+                  }
+                }
+                if (d != null) {
+                    items.add(d.newInstance(req, jo));
+                } else {
+                    LOGGER.log(Level.WARNING, "Received unexpected form data element: {0}", jo);
+                }
             }
         }
 
@@ -892,24 +949,60 @@ public abstract class Descriptor<T extends Describable<T>> implements Saveable {
     }
 
     /**
-     * Finds a descriptor from a collection by its class name.
+     * Finds a descriptor from a collection by its ID.
+     * @param id should match {@link #getId}
+     * @since 1.610
      */
-    public static <T extends Descriptor> T find(Collection<? extends T> list, String className) {
+    public static @CheckForNull <T extends Descriptor> T findById(Collection<? extends T> list, String id) {
         for (T d : list) {
-            if(d.getClass().getName().equals(className))
-                return d;
-        }
-        // Since we introduced Descriptor.getId(), it is a preferred method of identifying descriptor by a string.
-        // To make that migration easier without breaking compatibility, let's also match up with the id.
-        for (T d : list) {
-            if(d.getId().equals(className))
+            if(d.getId().equals(id))
                 return d;
         }
         return null;
     }
 
-    public static Descriptor find(String className) {
-        return find(Jenkins.getInstance().getExtensionList(Descriptor.class),className);
+    /**
+     * Finds a descriptor from a collection by the class name of the {@link Descriptor}.
+     * This is useless as of the introduction of {@link #getId} and so only very old compatibility code needs it.
+     */
+    private static @CheckForNull <T extends Descriptor> T findByClassName(Collection<? extends T> list, String className) {
+        for (T d : list) {
+            if(d.getClass().getName().equals(className))
+                return d;
+        }
+        return null;
+    }
+
+    /**
+     * Finds a descriptor from a collection by the class name of the {@link Describable} it describes.
+     * @param className should match {@link Class#getName} of a {@link #clazz}
+     * @since 1.610
+     */
+    public static @CheckForNull <T extends Descriptor> T findByDescribableClassName(Collection<? extends T> list, String className) {
+        for (T d : list) {
+            if(d.clazz.getName().equals(className))
+                return d;
+        }
+        return null;
+    }
+
+    /**
+     * Finds a descriptor from a collection by its class name or ID.
+     * @deprecated choose between {@link #findById} or {@link #findByDescribableClassName}
+     */
+    public static @CheckForNull <T extends Descriptor> T find(Collection<? extends T> list, String string) {
+        T d = findByClassName(list, string);
+        if (d != null) {
+                return d;
+        }
+        return findById(list, string);
+    }
+
+    /**
+     * @deprecated choose between {@link #findById} or {@link #findByDescribableClassName}
+     */
+    public static @CheckForNull Descriptor find(String className) {
+        return find(ExtensionList.lookup(Descriptor.class),className);
     }
 
     public static final class FormException extends Exception implements HttpResponse {
@@ -938,17 +1031,17 @@ public abstract class Descriptor<T extends Describable<T>> implements Saveable {
         }
 
         public void generateResponse(StaplerRequest req, StaplerResponse rsp, Object node) throws IOException, ServletException {
-            // for now, we can't really use the field name that caused the problem.
-            new Failure(getMessage()).generateResponse(req,rsp,node);
+            if (FormApply.isApply(req)) {
+                FormApply.applyResponse("notificationBar.show(" + quote(getMessage())+ ",notificationBar.ERROR)")
+                        .generateResponse(req, rsp, node);
+            } else {
+                // for now, we can't really use the field name that caused the problem.
+                new Failure(getMessage()).generateResponse(req,rsp,node);
+            }
         }
     }
 
     private static final Logger LOGGER = Logger.getLogger(Descriptor.class.getName());
-
-    /**
-     * Used in {@link #checkMethods} to indicate that there's no check method.
-     */
-    private static final String NONE = "\u0000";
 
     /**
      * Special type indicating that {@link Descriptor} describes itself.

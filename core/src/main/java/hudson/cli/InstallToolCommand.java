@@ -31,10 +31,7 @@ import hudson.model.AbstractProject;
 import hudson.model.Run;
 import hudson.model.Executor;
 import hudson.model.Node;
-import hudson.model.EnvironmentSpecific;
 import hudson.model.Item;
-import hudson.remoting.Callable;
-import hudson.slaves.NodeSpecific;
 import hudson.util.EditDistance;
 import hudson.util.StreamTaskListener;
 import hudson.tools.ToolDescriptor;
@@ -44,6 +41,7 @@ import java.util.List;
 import java.util.ArrayList;
 import java.io.IOException;
 
+import jenkins.security.MasterToSlaveCallable;
 import org.kohsuke.args4j.Argument;
 
 /**
@@ -122,20 +120,16 @@ public class InstallToolCommand extends CLICommand {
             throw new AbortException(b.getFullDisplayName()+" is not building");
 
         Node node = exec.getOwner().getNode();
+        if (node == null) {
+            throw new AbortException("The node " + exec.getOwner().getDisplayName() + " has been deleted");
+        }
 
-        if (t instanceof NodeSpecific) {
-            NodeSpecific n = (NodeSpecific) t;
-            t = (ToolInstallation)n.forNode(node,new StreamTaskListener(stderr));
-        }
-        if (t instanceof EnvironmentSpecific) {
-            EnvironmentSpecific e = (EnvironmentSpecific) t;
-            t = (ToolInstallation)e.forEnvironment(EnvVars.getRemote(checkChannel()));
-        }
+        t = t.translate(node, EnvVars.getRemote(checkChannel()), new StreamTaskListener(stderr));
         stdout.println(t.getHome());
         return 0;
     }
 
-    private static final class BuildIDs implements Callable<BuildIDs, IOException> {
+    private static final class BuildIDs extends MasterToSlaveCallable<BuildIDs, IOException> {
         String job,number,id;
 
         public BuildIDs call() throws IOException {

@@ -35,6 +35,8 @@ import hudson.model.Queue;
 import hudson.model.Queue.BuildableItem;
 import hudson.model.Queue.Task;
 
+import javax.annotation.CheckForNull;
+
 /**
  * Vetos the execution of a task on a node
  *
@@ -64,9 +66,10 @@ public abstract class QueueTaskDispatcher implements ExtensionPoint {
      * (This relationship is also the same with built-in check logic.)
      *
      * @deprecated since 1.413
-     *      Use {@link #canTake(Node, BuildableItem)}
+     *      Use {@link #canTake(Node, Queue.BuildableItem)}
      */
-    public CauseOfBlockage canTake(Node node, Task task) {
+    @Deprecated
+    public @CheckForNull CauseOfBlockage canTake(Node node, Task task) {
         return null;
     }
 
@@ -85,7 +88,7 @@ public abstract class QueueTaskDispatcher implements ExtensionPoint {
      *
      * <p>
      * This method is primarily designed to fine-tune where the execution should take place. If the execution
-     * shouldn't commence anywhere at all, implementation should use {@link #canRun(Item)} instead so
+     * shouldn't commence anywhere at all, implementation should use {@link #canRun(Queue.Item)} instead so
      * that Jenkins understands the difference between "this node isn't the right place for this work"
      * vs "the time isn't right for this work to execute." This affects the provisioning behaviour
      * with elastic Jenkins deployments.
@@ -97,19 +100,19 @@ public abstract class QueueTaskDispatcher implements ExtensionPoint {
      *
      * @since 1.413
      */
-    public CauseOfBlockage canTake(Node node, BuildableItem item) {
+    public @CheckForNull CauseOfBlockage canTake(Node node, BuildableItem item) {
         return canTake(node,item.task); // backward compatible behaviour
     }
 
     /**
-     * Called whenever {@link Queue} is considering if {@link Queue.Item} is ready to execute immediately
+     * Called whenever {@link Queue} is considering if {@link hudson.model.Queue.Item} is ready to execute immediately
      * (which doesn't necessarily mean that it gets executed right away &mdash; it's still subject to
      * executor availability), or if it should be considered blocked.
      *
      * <p>
-     * Compared to {@link #canTake(Node, BuildableItem)}, this version tells Jenkins that the task is
+     * Compared to {@link #canTake(Node, Queue.BuildableItem)}, this version tells Jenkins that the task is
      * simply not ready to execute, even if there's available executor. This is more efficient
-     * than {@link #canTake(Node, BuildableItem)}, and it sends the right signal to Jenkins so that
+     * than {@link #canTake(Node, Queue.BuildableItem)}, and it sends the right signal to Jenkins so that
      * it won't use {@link Cloud} to try to provision new executors.
      *
      * <p>
@@ -129,7 +132,7 @@ public abstract class QueueTaskDispatcher implements ExtensionPoint {
      *      the build is blocked.
      * @since 1.427
      */
-    public CauseOfBlockage canRun(Queue.Item item) {
+    public @CheckForNull CauseOfBlockage canRun(Queue.Item item) {
         return null;
     }
 
@@ -137,6 +140,6 @@ public abstract class QueueTaskDispatcher implements ExtensionPoint {
      * All registered {@link QueueTaskDispatcher}s.
      */
     public static ExtensionList<QueueTaskDispatcher> all() {
-        return Jenkins.getInstance().getExtensionList(QueueTaskDispatcher.class);
+        return ExtensionList.lookup(QueueTaskDispatcher.class);
     }
 }

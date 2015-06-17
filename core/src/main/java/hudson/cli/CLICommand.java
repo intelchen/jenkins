@@ -36,7 +36,9 @@ import hudson.remoting.Channel;
 import hudson.remoting.ChannelProperty;
 import hudson.security.CliAuthenticator;
 import hudson.security.SecurityRealm;
+import jenkins.security.MasterToSlaveCallable;
 import org.acegisecurity.Authentication;
+import org.acegisecurity.BadCredentialsException;
 import org.acegisecurity.context.SecurityContext;
 import org.acegisecurity.context.SecurityContextHolder;
 import org.apache.commons.discovery.ResourceClassIterator;
@@ -46,12 +48,15 @@ import org.apache.commons.discovery.resource.classes.DiscoverClasses;
 import org.apache.commons.discovery.resource.names.DiscoverServiceNames;
 import org.jvnet.hudson.annotation_indexer.Index;
 import org.jvnet.tiger_types.Types;
+import org.kohsuke.accmod.Restricted;
+import org.kohsuke.accmod.restrictions.NoExternalUse;
 import org.kohsuke.args4j.ClassParser;
 import org.kohsuke.args4j.CmdLineException;
 import org.kohsuke.args4j.CmdLineParser;
 import org.kohsuke.args4j.spi.OptionHandler;
 
 import java.io.BufferedInputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.PrintStream;
@@ -60,6 +65,7 @@ import java.nio.charset.Charset;
 import java.nio.charset.UnsupportedCharsetException;
 import java.util.List;
 import java.util.Locale;
+import java.util.UUID;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
@@ -86,7 +92,7 @@ import java.util.logging.Logger;
  * Put {@link Extension} on your implementation to have it discovered by Hudson.
  *
  * <li>
- * Use <a href="http://args4j.dev.java.net/">args4j</a> annotation on your implementation to define
+ * Use <a href="https://github.com/kohsuke/args4j">args4j</a> annotation on your implementation to define
  * options and arguments (however, if you don't like that, you could override
  * the {@link #main(List, Locale, InputStream, PrintStream, PrintStream)} method directly.
  *
@@ -179,19 +185,45 @@ public abstract class CLICommand implements ExtensionPoint, Cloneable {
      */
     public abstract String getShortDescription();
 
+    /**
+     * Entry point to the CLI command.
+     * 
+     * <p>
+     * The default implementation uses args4j to parse command line arguments and call {@link #run()},
+     * but if that processing is undesirable, subtypes can directly override this method and leave {@link #run()}
+     * to an empty method.
+     * You would however then have to consider {@link CliAuthenticator} and {@link #getTransportAuthentication},
+     * so this is not really recommended.
+     * 
+     * @param args
+     *      Arguments to the sub command. For example, if the CLI is invoked like "java -jar cli.jar foo bar zot",
+     *      then "foo" is the sub-command and the argument list is ["bar","zot"].
+     * @param locale
+     *      Locale of the client (which can be different from that of the server.) Good behaving command implementation
+     *      would use this locale for formatting messages.
+     * @param stdin
+     *      Connected to the stdin of the CLI client.
+     * @param stdout
+     *      Connected to the stdout of the CLI client.
+     * @param stderr
+     *      Connected to the stderr of the CLI client.
+     * @return
+     *      Exit code from the command.
+     */
     public int main(List<String> args, Locale locale, InputStream stdin, PrintStream stdout, PrintStream stderr) {
         this.stdin = new BufferedInputStream(stdin);
         this.stdout = stdout;
         this.stderr = stderr;
         this.locale = locale;
         registerOptionHandlers();
-        CmdLineParser p = new CmdLineParser(this);
+        CmdLineParser p = getCmdLineParser();
 
         // add options from the authenticator
         SecurityContext sc = SecurityContextHolder.getContext();
         Authentication old = sc.getAuthentication();
 
         CliAuthenticator authenticator = Jenkins.getInstance().getSecurityRealm().createCliAuthenticator(this);
+        sc.setAuthentication(getTransportAuthentication());
         new ClassParser().parse(authenticator,p);
 
         try {
@@ -211,12 +243,29 @@ public abstract class CLICommand implements ExtensionPoint, Cloneable {
             // signals an error without stack trace
             stderr.println(e.getMessage());
             return -1;
+        } catch (BadCredentialsException e) {
+            // to the caller, we can't reveal whether the user didn't exist or the password didn't match.
+            // do that to the server log instead
+            String id = UUID.randomUUID().toString();
+            LOGGER.log(Level.INFO, "CLI login attempt failed: "+id, e);
+            stderr.println("Bad Credentials. Search the server log for "+id+" for more details.");
+            return -1;
         } catch (Exception e) {
             e.printStackTrace(stderr);
             return -1;
         } finally {
             sc.setAuthentication(old); // restore
         }
+    }
+
+    /**
+     * Get parser for this command.
+     *
+     * Exposed to be overridden by {@link hudson.cli.declarative.CLIRegisterer}.
+     * @since 1.538
+     */
+    protected CmdLineParser getCmdLineParser() {
+        return new CmdLineParser(this);
     }
     
     public Channel checkChannel() throws AbortException {
@@ -288,6 +337,10 @@ public abstract class CLICommand implements ExtensionPoint, Cloneable {
 
     /**
      * Executes the command, and return the exit code.
+     * 
+     * <p>
+     * This is an internal contract between {@link CLICommand} and its subtype.
+     * To execute CLI method from outside, use {@link #main(List, Locale, InputStream, PrintStream, PrintStream)}
      *
      * @return
      *      0 to indicate a success, otherwise an error code.
@@ -301,9 +354,44 @@ public abstract class CLICommand implements ExtensionPoint, Cloneable {
     protected abstract int run() throws Exception;
 
     protected void printUsage(PrintStream stderr, CmdLineParser p) {
-        stderr.println("java -jar jenkins-cli.jar "+getName()+" args...");
+        stderr.print("java -jar jenkins-cli.jar " + getName());
+        p.printSingleLineUsage(stderr);
+        stderr.println();
         printUsageSummary(stderr);
         p.printUsage(stderr);
+    }
+
+    /**
+     * Get single line summary as a string.
+     */
+    @Restricted(NoExternalUse.class)
+    public final String getSingleLineSummary() {
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        getCmdLineParser().printSingleLineUsage(out);
+        return out.toString();
+    }
+
+    /**
+     * Get usage as a string.
+     */
+    @Restricted(NoExternalUse.class)
+    public final String getUsage() {
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        getCmdLineParser().printUsage(out);
+        return out.toString();
+    }
+
+    /**
+     * Get long description as a string.
+     */
+    @Restricted(NoExternalUse.class)
+    public final String getLongDescription() {
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        PrintStream ps = new PrintStream(out);
+
+        printUsageSummary(ps);
+        ps.close();
+        return out.toString();
     }
 
     /**
@@ -322,7 +410,7 @@ public abstract class CLICommand implements ExtensionPoint, Cloneable {
         return checkChannel().call(new GetSystemProperty(name));
     }
 
-    private static final class GetSystemProperty implements Callable<String, IOException> {
+    private static final class GetSystemProperty extends MasterToSlaveCallable<String, IOException> {
         private final String name;
 
         private GetSystemProperty(String name) {
@@ -337,6 +425,11 @@ public abstract class CLICommand implements ExtensionPoint, Cloneable {
     }
 
     protected Charset getClientCharset() throws IOException, InterruptedException {
+        if (channel==null)
+            // for SSH, assume the platform default encoding
+            // this is in-line with the standard SSH behavior
+            return Charset.defaultCharset();
+
         String charsetName = checkChannel().call(new GetCharset());
         try {
             return Charset.forName(charsetName);
@@ -346,7 +439,7 @@ public abstract class CLICommand implements ExtensionPoint, Cloneable {
         }
     }
 
-    private static final class GetCharset implements Callable<String, IOException> {
+    private static final class GetCharset extends MasterToSlaveCallable<String, IOException> {
         public String call() throws IOException {
             return Charset.defaultCharset().name();
         }
@@ -361,7 +454,7 @@ public abstract class CLICommand implements ExtensionPoint, Cloneable {
         return checkChannel().call(new GetEnvironmentVariable(name));
     }
 
-    private static final class GetEnvironmentVariable implements Callable<String, IOException> {
+    private static final class GetEnvironmentVariable extends MasterToSlaveCallable<String, IOException> {
         private final String name;
 
         private GetEnvironmentVariable(String name) {
@@ -406,7 +499,7 @@ public abstract class CLICommand implements ExtensionPoint, Cloneable {
      * Returns all the registered {@link CLICommand}s.
      */
     public static ExtensionList<CLICommand> all() {
-        return Jenkins.getInstance().getExtensionList(CLICommand.class);
+        return ExtensionList.lookup(CLICommand.class);
     }
 
     /**
@@ -445,17 +538,20 @@ public abstract class CLICommand implements ExtensionPoint, Cloneable {
     static {
         // register option handlers that are defined
         ClassLoaders cls = new ClassLoaders();
-        cls.put(Jenkins.getInstance().getPluginManager().uberClassLoader);
+        Jenkins j = Jenkins.getInstance();
+        if (j!=null) {// only when running on the master
+            cls.put(j.getPluginManager().uberClassLoader);
 
-        ResourceNameIterator servicesIter =
-            new DiscoverServiceNames(cls).findResourceNames(OptionHandler.class.getName());
-        final ResourceClassIterator itr =
-            new DiscoverClasses(cls).findResourceClasses(servicesIter);
+            ResourceNameIterator servicesIter =
+                new DiscoverServiceNames(cls).findResourceNames(OptionHandler.class.getName());
+            final ResourceClassIterator itr =
+                new DiscoverClasses(cls).findResourceClasses(servicesIter);
 
-        while(itr.hasNext()) {
-            Class h = itr.nextResourceClass().loadClass();
-            Class c = Types.erasure(Types.getTypeArgument(Types.getBaseClass(h, OptionHandler.class), 0));
-            CmdLineParser.registerHandler(c,h);
+            while(itr.hasNext()) {
+                Class h = itr.nextResourceClass().loadClass();
+                Class c = Types.erasure(Types.getTypeArgument(Types.getBaseClass(h, OptionHandler.class), 0));
+                CmdLineParser.registerHandler(c,h);
+            }
         }
     }
 }

@@ -39,15 +39,21 @@ import hudson.lifecycle.RestartNotSupportedException;
 import hudson.model.UpdateSite.Data;
 import hudson.model.UpdateSite.Plugin;
 import hudson.model.listeners.SaveableListener;
+import hudson.remoting.AtmostOneThreadExecutor;
 import hudson.security.ACL;
 import hudson.util.DaemonThreadFactory;
+import hudson.util.FormValidation;
 import hudson.util.HttpResponses;
+import hudson.util.NamingThreadFactory;
 import hudson.util.IOException2;
+import hudson.util.IOUtils;
 import hudson.util.PersistedList;
 import hudson.util.XStream2;
 import jenkins.RestartRequiredException;
 import jenkins.model.Jenkins;
+import jenkins.util.io.OnMaster;
 import org.acegisecurity.Authentication;
+import org.acegisecurity.context.SecurityContext;
 import org.apache.commons.io.input.CountingInputStream;
 import org.apache.commons.io.output.NullOutputStream;
 import org.jvnet.localizer.Localizable;
@@ -68,20 +74,28 @@ import java.net.UnknownHostException;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.TreeSet;
 import java.util.Vector;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
-import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.jar.Attributes;
 import java.util.jar.JarFile;
 import java.util.logging.Level;
 import java.util.logging.Logger;
+import javax.annotation.CheckForNull;
 import org.acegisecurity.context.SecurityContextHolder;
+import org.kohsuke.accmod.Restricted;
+import org.kohsuke.accmod.restrictions.NoExternalUse;
+import org.kohsuke.stapler.export.Exported;
+import org.kohsuke.stapler.export.ExportedBean;
+import org.kohsuke.stapler.interceptor.RequirePOST;
 
 
 /**
@@ -99,22 +113,33 @@ import org.acegisecurity.context.SecurityContextHolder;
  * @author Kohsuke Kawaguchi
  * @since 1.220
  */
-public class UpdateCenter extends AbstractModelObject implements Saveable {
+@ExportedBean
+public class UpdateCenter extends AbstractModelObject implements Saveable, OnMaster {
 	
     private static final String UPDATE_CENTER_URL = System.getProperty(UpdateCenter.class.getName()+".updateCenterUrl","http://updates.jenkins-ci.org/");
+
+    /**
+     * {@linkplain UpdateSite#getId() ID} of the default update site.
+     * @since 1.483
+     */
+    public static final String ID_DEFAULT = "default";
+
+    @Restricted(NoExternalUse.class)
+    public static final String ID_UPLOAD = "_upload";
 	
     /**
      * {@link ExecutorService} that performs installation.
+     * @since 1.501
      */
-    private final ExecutorService installerService = Executors.newSingleThreadExecutor(
-        new DaemonThreadFactory(new ThreadFactory() {
-            public Thread newThread(Runnable r) {
-                Thread t = new Thread(r);
-                t.setName("Update center installer thread");
-                return t;
-            }
-        }));
+    private final ExecutorService installerService = new AtmostOneThreadExecutor(
+        new NamingThreadFactory(new DaemonThreadFactory(), "Update center installer thread"));
 
+    /**
+     * An {@link ExecutorService} for updating UpdateSites.
+     */
+    protected final ExecutorService updateService = Executors.newCachedThreadPool(
+        new NamingThreadFactory(new DaemonThreadFactory(), "Update site data downloader"));
+        
     /**
      * List of created {@link UpdateCenterJob}s. Access needs to be synchronized.
      */
@@ -136,8 +161,14 @@ public class UpdateCenter extends AbstractModelObject implements Saveable {
      */
     private UpdateCenterConfiguration config;
 
+    private boolean requiresRestart;
+
     public UpdateCenter() {
         configure(new UpdateCenterConfiguration());
+    }
+
+    public Api getApi() {
+        return new Api(this);
     }
 
     /**
@@ -160,10 +191,26 @@ public class UpdateCenter extends AbstractModelObject implements Saveable {
      * @return
      *      can be empty but never null. Oldest entries first.
      */
+    @Exported
     public List<UpdateCenterJob> getJobs() {
         synchronized (jobs) {
             return new ArrayList<UpdateCenterJob>(jobs);
         }
+    }
+
+    /**
+     * Gets a job by its ID.
+     *
+     * Primarily to make {@link UpdateCenterJob} bound to URL.
+     */
+    public UpdateCenterJob getJob(int id) {
+        synchronized (jobs) {
+            for (UpdateCenterJob job : jobs) {
+                if (job.id==id)
+                    return job;
+            }
+        }
+        return null;
     }
 
     /**
@@ -206,11 +253,19 @@ public class UpdateCenter extends AbstractModelObject implements Saveable {
         return sites;
     }
 
+    /**
+     * The same as {@link #getSites()} but for REST API.
+     */
+    @Exported(name="sites")
+    public List<UpdateSite> getSiteList() {
+        return sites.toList();
+    }
+
+    /**
+     * Alias for {@link #getById}.
+     */
     public UpdateSite getSite(String id) {
-        for (UpdateSite site : sites)
-            if (site.getId().equals(id))
-                return site;
-        return null;
+        return getById(id);
     }
 
     /**
@@ -218,13 +273,15 @@ public class UpdateCenter extends AbstractModelObject implements Saveable {
      * Will be the newest of all {@link UpdateSite}s.
      */
     public String getLastUpdatedString() {
-        long newestTs = -1;
+        long newestTs = 0;
         for (UpdateSite s : sites) {
             if (s.getDataTimestamp()>newestTs) {
                 newestTs = s.getDataTimestamp();
             }
         }
-        if(newestTs<0)     return "N/A";
+        if (newestTs == 0) {
+            return Messages.UpdateCenter_n_a();
+        }
         return Util.getPastTimeString(System.currentTimeMillis()-newestTs);
     }
 
@@ -263,6 +320,7 @@ public class UpdateCenter extends AbstractModelObject implements Saveable {
      *      TODO: revisit tool update mechanism, as that should be de-centralized, too. In the mean time,
      *      please try not to use this method, and instead ping us to get this part completed.
      */
+    @Deprecated
     public String getDefaultBaseUrl() {
         return config.getUpdateCenterUrl();
     }
@@ -270,7 +328,7 @@ public class UpdateCenter extends AbstractModelObject implements Saveable {
     /**
      * Gets the plugin with the given name from the first {@link UpdateSite} to contain it.
      */
-    public Plugin getPlugin(String artifactId) {
+    public @CheckForNull Plugin getPlugin(String artifactId) {
         for (UpdateSite s : sites) {
             Plugin p = s.getPlugin(artifactId);
             if (p!=null) return p;
@@ -281,8 +339,8 @@ public class UpdateCenter extends AbstractModelObject implements Saveable {
     /**
      * Schedules a Jenkins upgrade.
      */
+    @RequirePOST
     public void doUpgrade(StaplerResponse rsp) throws IOException, ServletException {
-        requirePOST();
         Jenkins.getInstance().checkPermission(Jenkins.ADMINISTER);
         HudsonUpgradeJob job = new HudsonUpgradeJob(getCoreSource(), Jenkins.getAuthentication());
         if(!Lifecycle.get().canRewriteHudsonWar()) {
@@ -339,10 +397,27 @@ public class UpdateCenter extends AbstractModelObject implements Saveable {
         }
         response.sendRedirect2(".");
     }
-    
+
     /**
-     * Checks if restart is scheduled
-     * 
+     * If any of the executed {@link UpdateCenterJob}s requires a restart
+     * to take effect, this method returns true.
+     *
+     * <p>
+     * This doesn't necessarily mean the user has scheduled or initiated
+     * the restart operation.
+     *
+     * @see #isRestartScheduled()
+     */
+    @Exported
+    public boolean isRestartRequiredForCompletion() {
+        return requiresRestart;
+    }
+
+    /**
+     * Checks if the restart operation is scheduled
+     * (which means in near future Jenkins will restart by itself)
+     *
+     * @see #isRestartRequiredForCompletion()
      */
     public boolean isRestartScheduled() {
         for (UpdateCenterJob job : getJobs()) {
@@ -367,8 +442,8 @@ public class UpdateCenter extends AbstractModelObject implements Saveable {
     /**
      * Performs hudson downgrade.
      */
+    @RequirePOST
     public void doDowngrade(StaplerResponse rsp) throws IOException, ServletException {
-        requirePOST();
         Jenkins.getInstance().checkPermission(Jenkins.ADMINISTER);
         if(!isDowngradable()) {
             sendError("Jenkins downgrade is not possible, probably backup does not exist");
@@ -400,10 +475,14 @@ public class UpdateCenter extends AbstractModelObject implements Saveable {
     public String getBackupVersion() {
         try {
             JarFile backupWar = new JarFile(new File(Lifecycle.get().getHudsonWar() + ".bak"));
-            Attributes attrs = backupWar.getManifest().getMainAttributes();
-            String v = attrs.getValue("Jenkins-Version");
-            if (v==null)    v = attrs.getValue("Hudson-Version");
-            return v;
+            try {
+                Attributes attrs = backupWar.getManifest().getMainAttributes();
+                String v = attrs.getValue("Jenkins-Version");
+                if (v==null)    v = attrs.getValue("Hudson-Version");
+                return v;
+            } finally {
+                backupWar.close();
+            }
         } catch (IOException e) {
             LOGGER.log(Level.WARNING, "Failed to read backup version ", e);
             return null;}
@@ -442,7 +521,7 @@ public class UpdateCenter extends AbstractModelObject implements Saveable {
      * Loads the data from the disk into this object.
      */
     public synchronized void load() throws IOException {
-        UpdateSite defaultSite = new UpdateSite("default", config.getUpdateCenterUrl() + "update-center.json");
+        UpdateSite defaultSite = new UpdateSite(ID_DEFAULT, config.getUpdateCenterUrl() + "update-center.json");
         XmlFile file = getConfigFile();
         if(file.exists()) {
             try {
@@ -473,13 +552,24 @@ public class UpdateCenter extends AbstractModelObject implements Saveable {
     }
 
     public List<Plugin> getAvailables() {
-        List<Plugin> plugins = new ArrayList<Plugin>();
-
-        for (UpdateSite s : sites) {
-            plugins.addAll(s.getAvailables());
+        Map<String,Plugin> pluginMap = new LinkedHashMap<String, Plugin>();
+        for (UpdateSite site : sites) {
+            for (Plugin plugin: site.getAvailables()) {
+                final Plugin existing = pluginMap.get(plugin.name);
+                if (existing == null) {
+                    pluginMap.put(plugin.name, plugin);
+                } else if (!existing.version.equals(plugin.version)) {
+                    // allow secondary update centers to publish different versions
+                    // TODO refactor to consolidate multiple versions of the same plugin within the one row
+                    final String altKey = plugin.name + ":" + plugin.version;
+                    if (!pluginMap.containsKey(altKey)) {
+                        pluginMap.put(altKey, plugin);
+                    }
+                }
+            }
         }
 
-        return plugins;
+        return new ArrayList<Plugin>(pluginMap.values());
     }
 
     /**
@@ -510,13 +600,50 @@ public class UpdateCenter extends AbstractModelObject implements Saveable {
     }
 
     public List<Plugin> getUpdates() {
-        List<Plugin> plugins = new ArrayList<Plugin>();
-
-        for (UpdateSite s : sites) {
-            plugins.addAll(s.getUpdates());
+        Map<String,Plugin> pluginMap = new LinkedHashMap<String, Plugin>();
+        for (UpdateSite site : sites) {
+            for (Plugin plugin: site.getUpdates()) {
+                final Plugin existing = pluginMap.get(plugin.name);
+                if (existing == null) {
+                    pluginMap.put(plugin.name, plugin);
+                } else if (!existing.version.equals(plugin.version)) {
+                    // allow secondary update centers to publish different versions
+                    // TODO refactor to consolidate multiple versions of the same plugin within the one row
+                    final String altKey = plugin.name + ":" + plugin.version;
+                    if (!pluginMap.containsKey(altKey)) {
+                        pluginMap.put(altKey, plugin);
+                    }
+                }
+            }
         }
 
-        return plugins;
+        return new ArrayList<Plugin>(pluginMap.values());
+    }
+    
+    /**
+     * Ensure that all UpdateSites are up to date, without requiring a user to
+     * browse to the instance.
+     * 
+     * @return a list of {@link FormValidation} for each updated Update Site
+     * @throws ExecutionException 
+     * @throws InterruptedException 
+     * @since 1.501
+     * 
+     */
+    public List<FormValidation> updateAllSites() throws InterruptedException, ExecutionException {
+        List <Future<FormValidation>> futures = new ArrayList<Future<FormValidation>>();
+        for (UpdateSite site : getSites()) {
+            Future<FormValidation> future = site.updateDirectly(DownloadService.signatureCheck);
+            if (future != null) {
+                futures.add(future);
+            }
+        }
+        
+        List<FormValidation> results = new ArrayList<FormValidation>(); 
+        for (Future<FormValidation> f : futures) {
+            results.add(f.get());
+        }
+        return results;
     }
 
 
@@ -621,29 +748,34 @@ public class UpdateCenter extends AbstractModelObject implements Saveable {
          * @see DownloadJob
          */
         public File download(DownloadJob job, URL src) throws IOException {
+            CountingInputStream in = null;
+            OutputStream out = null;
+            URLConnection con = null;
             try {
-                URLConnection con = connect(job,src);
+                con = connect(job,src);
                 int total = con.getContentLength();
-                CountingInputStream in = new CountingInputStream(con.getInputStream());
+                in = new CountingInputStream(con.getInputStream());
                 byte[] buf = new byte[8192];
                 int len;
 
                 File dst = job.getDestination();
                 File tmp = new File(dst.getPath()+".tmp");
-                OutputStream out = new FileOutputStream(tmp);
+                out = new FileOutputStream(tmp);
 
                 LOGGER.info("Downloading "+job.getName());
+                Thread t = Thread.currentThread();
+                String oldName = t.getName();
+                t.setName(oldName + ": " + src);
                 try {
                     while((len=in.read(buf))>=0) {
                         out.write(buf,0,len);
                         job.status = job.new Installing(total==-1 ? -1 : in.getCount()*100/total);
                     }
                 } catch (IOException e) {
-                    throw new IOException2("Failed to load "+src+" to "+tmp,e);
+                    throw new IOException("Failed to load "+src+" to "+tmp,e);
+                } finally {
+                    t.setName(oldName);
                 }
-
-                in.close();
-                out.close();
 
                 if (total!=-1 && total!=tmp.length()) {
                     // don't know exactly how this happens, but report like
@@ -654,7 +786,18 @@ public class UpdateCenter extends AbstractModelObject implements Saveable {
 
                 return tmp;
             } catch (IOException e) {
-                throw new IOException2("Failed to download from "+src,e);
+                // assist troubleshooting in case of e.g. "too many redirects" by printing actual URL
+                String extraMessage = "";
+                if (con != null && con.getURL() != null && !src.toString().equals(con.getURL().toString())) {
+                    // Two URLs are considered equal if different hosts resolve to same IP. Prefer to log in case of string inequality,
+                    // because who knows how the server responds to different host name in the request header?
+                    // Also, since it involved name resolution, it'd be an expensive operation.
+                    extraMessage = " (redirected to: " + con.getURL() + ")";
+                }
+                throw new IOException2("Failed to download from "+src+extraMessage,e);
+            } finally {
+                IOUtils.closeQuietly(in);
+                IOUtils.closeQuietly(out);
             }
         }
 
@@ -700,6 +843,7 @@ public class UpdateCenter extends AbstractModelObject implements Saveable {
          *      is now a part of the <tt>update-center.json</tt> file. See
          *      <tt>http://jenkins-ci.org/update-center.json</tt> as an example.
          */
+        @Deprecated
         public String getConnectionCheckUrl() {
             return "http://www.google.com";
         }
@@ -714,6 +858,7 @@ public class UpdateCenter extends AbstractModelObject implements Saveable {
          * @return
          *      Absolute URL that ends with '/'.
          */
+        @Deprecated
         public String getUpdateCenterUrl() {
             return UPDATE_CENTER_URL;
         }
@@ -725,6 +870,7 @@ public class UpdateCenter extends AbstractModelObject implements Saveable {
          *      <tt>update-center.json</tt> is now signed, so we don't have to further make sure that
          *      we aren't downloading from anywhere unsecure.
          */
+        @Deprecated
         public String getPluginRepositoryBaseUrl() {
             return "http://jenkins-ci.org/";
         }
@@ -736,7 +882,7 @@ public class UpdateCenter extends AbstractModelObject implements Saveable {
             } catch (SSLHandshakeException e) {
                 if (e.getMessage().contains("PKIX path building failed"))
                    // fix up this crappy error message from JDK
-                    throw new IOException2("Failed to validate the SSL certificate of "+url,e);
+                    throw new IOException("Failed to validate the SSL certificate of "+url,e);
             }
         }
     }
@@ -746,7 +892,16 @@ public class UpdateCenter extends AbstractModelObject implements Saveable {
      *
      * This object will have the <tt>row.jelly</tt> which renders the job on UI.
      */
+    @ExportedBean
     public abstract class UpdateCenterJob implements Runnable {
+        /**
+         * Unique ID that identifies this job.
+         *
+         * @see UpdateCenter#getJob(int)
+         */
+        @Exported
+        public final int id = iota.incrementAndGet();
+
         /**
          * Which {@link UpdateSite} does this belong to?
          */
@@ -761,12 +916,22 @@ public class UpdateCenter extends AbstractModelObject implements Saveable {
             this.site = site;
         }
 
+        public Api getApi() {
+            return new Api(this);
+        }
+
         /**
          * @deprecated as of 1.326
          *      Use {@link #submit()} instead.
          */
+        @Deprecated
         public void schedule() {
             submit();
+        }
+
+        @Exported
+        public String getType() {
+            return getClass().getSimpleName();
         }
 
         /**
@@ -780,6 +945,11 @@ public class UpdateCenter extends AbstractModelObject implements Saveable {
             return installerService.submit(this,this);
         }
 
+        @Exported
+        public String getErrorMessage() {
+            return error != null ? error.getMessage() : null;
+        }
+        
         public Throwable getError() {
             return error;
         }
@@ -789,14 +959,10 @@ public class UpdateCenter extends AbstractModelObject implements Saveable {
      * Restarts jenkins.
      */
     public class RestartJenkinsJob extends UpdateCenterJob {
-        /**
-         * Unique ID that identifies this job.
-         */
-        public final int id = iota.incrementAndGet();
-               
          /**
          * Immutable state of this job.
          */
+         @Exported(inline=true)
         public volatile RestartJenkinsJobStatus status = new Pending();
         
         /**
@@ -827,15 +993,19 @@ public class UpdateCenter extends AbstractModelObject implements Saveable {
                 error = exception;
             }
         }
-        
+
+        @ExportedBean
         public abstract class RestartJenkinsJobStatus {
-            
+            @Exported
             public final int id = iota.incrementAndGet();
    
         }
         
         public class Pending extends RestartJenkinsJobStatus {
-            
+            @Exported
+            public String getType() {
+                return getClass().getSimpleName();
+            }
         }
         
         public class Running extends RestartJenkinsJobStatus {
@@ -862,6 +1032,9 @@ public class UpdateCenter extends AbstractModelObject implements Saveable {
         }
 
         public void run() {
+            if (ID_UPLOAD.equals(site.getId())) {
+                return;
+            }
             LOGGER.fine("Doing a connectivity check");
             try {
                 String connectionCheckUrl = site.getConnectionCheckUrl();
@@ -908,12 +1081,9 @@ public class UpdateCenter extends AbstractModelObject implements Saveable {
      */
     public abstract class DownloadJob extends UpdateCenterJob {
         /**
-         * Unique ID that identifies this job.
-         */
-        public final int id = iota.incrementAndGet();
-        /**
          * Immutable object representing the current state of this job.
          */
+        @Exported(inline=true)
         public volatile InstallationStatus status = new Pending();
 
         /**
@@ -926,6 +1096,7 @@ public class UpdateCenter extends AbstractModelObject implements Saveable {
          */
         protected abstract File getDestination();
 
+        @Exported
         public abstract String getName();
 
         /**
@@ -960,6 +1131,7 @@ public class UpdateCenter extends AbstractModelObject implements Saveable {
             } catch (InstallationStatus e) {
                 status = e;
                 if (status.isSuccess()) onSuccess();
+                requiresRestart |= status.requiresRestart();
             } catch (Throwable e) {
                 LOGGER.log(Level.SEVERE, "Failed to install "+getName(),e);
                 status = new Failure(e);
@@ -998,9 +1170,22 @@ public class UpdateCenter extends AbstractModelObject implements Saveable {
          * <p>
          * Instances of this class is immutable.
          */
+        @ExportedBean
         public abstract class InstallationStatus extends Throwable {
             public final int id = iota.incrementAndGet();
+            @Exported
             public boolean isSuccess() {
+                return false;
+            }
+            @Exported
+            public final String getType() {
+                return getClass().getSimpleName();
+            }
+
+            /**
+             * Indicates that a restart is needed to complete the tasks.
+             */
+            public boolean requiresRestart() {
                 return false;
             }
         }
@@ -1022,8 +1207,6 @@ public class UpdateCenter extends AbstractModelObject implements Saveable {
 
         /**
          * Indicates that the installation was successful but a restart is needed.
-         *
-         * @see
          */
         public class SuccessButRequiresRestart extends Success {
             private final Localizable message;
@@ -1034,6 +1217,11 @@ public class UpdateCenter extends AbstractModelObject implements Saveable {
 
             public String getMessage() {
                 return message.toString();
+            }
+
+            @Override
+            public boolean requiresRestart() {
+                return true;
             }
         }
 
@@ -1074,6 +1262,7 @@ public class UpdateCenter extends AbstractModelObject implements Saveable {
         /**
          * What plugin are we trying to install?
          */
+        @Exported
         public final Plugin plugin;
 
         private final PluginManager pm = Jenkins.getInstance().getPluginManager();
@@ -1086,6 +1275,7 @@ public class UpdateCenter extends AbstractModelObject implements Saveable {
         /**
          * @deprecated as of 1.442
          */
+        @Deprecated
         public InstallationJob(Plugin plugin, UpdateSite site, Authentication auth) {
             this(plugin,site,auth,false);
         }
@@ -1120,13 +1310,14 @@ public class UpdateCenter extends AbstractModelObject implements Saveable {
 
             // if this is a bundled plugin, make sure it won't get overwritten
             PluginWrapper pw = plugin.getInstalled();
-            if (pw!=null && pw.isBundled())
+            if (pw!=null && pw.isBundled()) {
+                SecurityContext oldContext = ACL.impersonate(ACL.SYSTEM);
                 try {
-                    SecurityContextHolder.getContext().setAuthentication(ACL.SYSTEM);
                     pw.doPin();
                 } finally {
-                    SecurityContextHolder.clearContext();
+                    SecurityContextHolder.setContext(oldContext);
                 }
+            }
 
             if (dynamicLoad) {
                 try {
@@ -1134,7 +1325,7 @@ public class UpdateCenter extends AbstractModelObject implements Saveable {
                 } catch (RestartRequiredException e) {
                     throw new SuccessButRequiresRestart(e.message);
                 } catch (Exception e) {
-                    throw new IOException2("Failed to dynamically deploy this plugin",e);
+                    throw new IOException("Failed to dynamically deploy this plugin",e);
                 }
             } else {
                 throw new SuccessButRequiresRestart(Messages._UpdateCenter_DownloadButNotActivated());
@@ -1364,7 +1555,7 @@ public class UpdateCenter extends AbstractModelObject implements Saveable {
      *
      * This has to wait until after all plugins load, to let custom UpdateCenterConfiguration take effect first.
      */
-    @Initializer(after=PLUGINS_STARTED)
+    @Initializer(after=PLUGINS_STARTED, fatal=false)
     public static void init(Jenkins h) throws IOException {
         h.getUpdateCenter().load();
     }
@@ -1380,6 +1571,7 @@ public class UpdateCenter extends AbstractModelObject implements Saveable {
      * @deprecated as of 1.333
      *      Use {@link UpdateSite#neverUpdate}
      */
+    @Deprecated
     public static boolean neverUpdate = Boolean.getBoolean(UpdateCenter.class.getName()+".never");
 
     public static final XStream2 XSTREAM = new XStream2();

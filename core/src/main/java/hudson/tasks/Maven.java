@@ -24,13 +24,13 @@
 package hudson.tasks;
 
 import hudson.Extension;
+import jenkins.MasterToSlaveFileCallable;
 import hudson.Launcher;
 import hudson.Functions;
 import hudson.EnvVars;
 import hudson.Util;
 import hudson.CopyOnWrite;
 import hudson.Launcher.LocalLauncher;
-import hudson.FilePath.FileCallable;
 import hudson.model.AbstractBuild;
 import hudson.model.AbstractProject;
 import hudson.model.BuildListener;
@@ -38,8 +38,10 @@ import hudson.model.Computer;
 import hudson.model.EnvironmentSpecific;
 import hudson.model.Node;
 import jenkins.model.Jenkins;
+import jenkins.mvn.GlobalMavenConfig;
+import jenkins.mvn.GlobalSettingsProvider;
+import jenkins.mvn.SettingsProvider;
 import hudson.model.TaskListener;
-import hudson.remoting.Callable;
 import hudson.remoting.VirtualChannel;
 import hudson.slaves.NodeSpecific;
 import hudson.tasks._maven.MavenConsoleAnnotator;
@@ -52,15 +54,20 @@ import hudson.util.ArgumentListBuilder;
 import hudson.util.NullStream;
 import hudson.util.StreamTaskListener;
 import hudson.util.VariableResolver;
+import hudson.util.VariableResolver.ByMap;
+import hudson.util.VariableResolver.Union;
 import hudson.util.FormValidation;
 import hudson.util.XStream2;
+import jenkins.security.MasterToSlaveCallable;
 import net.sf.json.JSONObject;
+
+import org.apache.commons.lang.StringUtils;
 import org.kohsuke.stapler.DataBoundConstructor;
 import org.kohsuke.stapler.StaplerRequest;
-import org.kohsuke.stapler.QueryParameter;
 
 import java.io.File;
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.Properties;
 import java.util.StringTokenizer;
 import java.util.List;
@@ -69,6 +76,7 @@ import java.util.Set;
 import java.util.jar.Attributes;
 import java.util.jar.JarFile;
 import java.util.jar.Manifest;
+import java.util.regex.Pattern;
 
 /**
  * Build by using Maven.
@@ -116,30 +124,73 @@ public class Maven extends Builder {
      * @since 1.322
      */
     public boolean usePrivateRepository = false;
+    
+    /**
+     * Provides access to the settings.xml to be used for a build.
+     * @since 1.491
+     */
+    private SettingsProvider settings;
+    
+    /**
+     * Provides access to the global settings.xml to be used for a build.
+     * @since 1.491
+     */
+    private GlobalSettingsProvider globalSettings;
 
     private final static String MAVEN_1_INSTALLATION_COMMON_FILE = "bin/maven";
     private final static String MAVEN_2_INSTALLATION_COMMON_FILE = "bin/mvn";
+    
+    private static final Pattern S_PATTERN = Pattern.compile("(^| )-s ");
+    private static final Pattern GS_PATTERN = Pattern.compile("(^| )-gs ");
 
     public Maven(String targets,String name) {
-        this(targets,name,null,null,null,false);
+        this(targets,name,null,null,null,false, null, null);
     }
 
     public Maven(String targets, String name, String pom, String properties, String jvmOptions) {
-	this(targets, name, pom, properties, jvmOptions, false);
+        this(targets, name, pom, properties, jvmOptions, false, null, null);
+    }
+    
+    public Maven(String targets,String name, String pom, String properties, String jvmOptions, boolean usePrivateRepository) {
+        this(targets, name, pom, properties, jvmOptions, usePrivateRepository, null, null);
     }
     
     @DataBoundConstructor
-    public Maven(String targets,String name, String pom, String properties, String jvmOptions, boolean usePrivateRepository) {
+    public Maven(String targets,String name, String pom, String properties, String jvmOptions, boolean usePrivateRepository, SettingsProvider settings, GlobalSettingsProvider globalSettings) {
         this.targets = targets;
         this.mavenName = name;
         this.pom = Util.fixEmptyAndTrim(pom);
         this.properties = Util.fixEmptyAndTrim(properties);
         this.jvmOptions = Util.fixEmptyAndTrim(jvmOptions);
         this.usePrivateRepository = usePrivateRepository;
+        this.settings = settings != null ? settings : GlobalMavenConfig.get().getSettingsProvider();
+        this.globalSettings = globalSettings != null ? globalSettings : GlobalMavenConfig.get().getGlobalSettingsProvider();
     }
 
     public String getTargets() {
         return targets;
+    }
+
+    /**
+     * @since 1.491
+     */
+    public SettingsProvider getSettings() {
+        return settings != null ? settings : GlobalMavenConfig.get().getSettingsProvider();
+    }
+    
+    protected void setSettings(SettingsProvider settings) {
+        this.settings = settings;
+    }
+    
+    /**
+     * @since 1.491
+     */
+    public GlobalSettingsProvider getGlobalSettings() {
+        return globalSettings != null ? globalSettings : GlobalMavenConfig.get().getGlobalSettingsProvider();
+    }
+    
+    protected void setGlobalSettings(GlobalSettingsProvider globalSettings) {
+        this.globalSettings = globalSettings;
     }
 
     public void setUsePrivateRepository(boolean usePrivateRepository) {
@@ -166,7 +217,7 @@ public class Maven extends Builder {
      * Looks for <tt>pom.xlm</tt> or <tt>project.xml</tt> to determine the maven executable
      * name.
      */
-    private static final class DecideDefaultMavenCommand implements FileCallable<String> {
+    private static final class DecideDefaultMavenCommand extends MasterToSlaveFileCallable<String> {
         private static final long serialVersionUID = -2327576423452215146L;
         // command line arguments.
         private final String arguments;
@@ -214,7 +265,6 @@ public class Maven extends Builder {
         String targets = Util.replaceMacro(this.targets,vr);
         targets = env.expand(targets);
         String pom = env.expand(this.pom);
-        String properties = env.expand(this.properties);
 
         int startIndex = 0;
         int endIndex;
@@ -246,17 +296,36 @@ public class Maven extends Builder {
             }
             if(pom!=null)
                 args.add("-f",pom);
+            
+            
+            if(!S_PATTERN.matcher(targets).find()){ // check the given target/goals do not contain settings parameter already
+                String settingsPath = SettingsProvider.getSettingsRemotePath(getSettings(), build, listener);
+                if(StringUtils.isNotBlank(settingsPath)){
+                    args.add("-s", settingsPath);
+                }
+            }
+            if(!GS_PATTERN.matcher(targets).find()){
+                String settingsPath = GlobalSettingsProvider.getSettingsRemotePath(getGlobalSettings(), build, listener);
+                if(StringUtils.isNotBlank(settingsPath)){
+                    args.add("-gs", settingsPath);
+                }
+            }
 
             Set<String> sensitiveVars = build.getSensitiveBuildVariables();
 
             args.addKeyValuePairs("-D",build.getBuildVariables(),sensitiveVars);
-            args.addKeyValuePairsFromPropertyString("-D",properties,vr,sensitiveVars);
+            final VariableResolver<String> resolver = new Union<String>(new ByMap<String>(env), vr);
+            args.addKeyValuePairsFromPropertyString("-D",this.properties,resolver,sensitiveVars);
             if (usesPrivateRepository())
                 args.add("-Dmaven.repo.local=" + build.getWorkspace().child(".repository"));
             args.addTokenized(normalizedTarget);
             wrapUpArguments(args,normalizedTarget,build,launcher,listener);
 
             buildEnvVars(env, mi);
+            
+            if (!launcher.isUnix()) {
+                args = args.toWindowsCommand();
+            }
 
             try {
                 MavenConsoleAnnotator mca = new MavenConsoleAnnotator(listener.getLogger(),build.getCharset());
@@ -294,8 +363,7 @@ public class Maven extends Builder {
             // The other solution would be to set M2_HOME if we are calling Maven2
             // and MAVEN_HOME for Maven1 (only of use for strange people that
             // are calling Maven2 from Maven1)
-            env.put("M2_HOME",mi.getHome());
-            env.put("MAVEN_HOME",mi.getHome());
+            mi.buildEnvVars(env);
         }
         // just as a precaution
         // see http://maven.apache.org/continuum/faqs.html#how-does-continuum-detect-a-successful-build
@@ -317,6 +385,7 @@ public class Maven extends Builder {
      *      For compatibility, this field retains the last created {@link DescriptorImpl}.
      *      TODO: fix sonar plugin that depends on this. That's the only plugin that depends on this field.
      */
+    @Deprecated
     public static DescriptorImpl DESCRIPTOR;
 
     @Extension
@@ -334,20 +403,39 @@ public class Maven extends Builder {
         }
 
         @Override
-        public String getHelpFile() {
-            return "/help/project-config/maven.html";
+        public String getHelpFile(String fieldName) {
+            if (fieldName != null && fieldName.equals("globalSettings")) fieldName = "settings"; // same help file
+            return super.getHelpFile(fieldName);
         }
 
         public String getDisplayName() {
             return Messages.Maven_DisplayName();
+        }
+        
+        public GlobalSettingsProvider getDefaultGlobalSettingsProvider() {
+            return GlobalMavenConfig.get().getGlobalSettingsProvider();
+        }
+        
+        public SettingsProvider getDefaultSettingsProvider() {
+            return GlobalMavenConfig.get().getSettingsProvider();
         }
 
         public MavenInstallation[] getInstallations() {
             return installations;
         }
 
-        public void setInstallations(MavenInstallation... installations) {
-            this.installations = installations;
+		public void setInstallations(MavenInstallation... installations) {
+			List<MavenInstallation> tmpList = new ArrayList<Maven.MavenInstallation>();
+			// remote empty Maven installation : 
+			if(installations != null) {
+				Collections.addAll(tmpList, installations);
+				for(MavenInstallation installation : installations) {
+					if(Util.fixEmptyAndTrim(installation.getName()) == null) {
+						tmpList.remove(installation);
+					}
+				}
+			}
+            this.installations = tmpList.toArray(new MavenInstallation[tmpList.size()]);
             save();
         }
 
@@ -377,8 +465,9 @@ public class Maven extends Builder {
 
         /**
          * @deprecated as of 1.308.
-         *      Use {@link #MavenInstallation(String, String, List)}
+         *      Use {@link #Maven.MavenInstallation(String, String, List)}
          */
+        @Deprecated
         public MavenInstallation(String name, String home) {
             super(name, home);
         }
@@ -393,12 +482,24 @@ public class Maven extends Builder {
          *
          * @deprecated as of 1.308. Use {@link #getHome()}.
          */
+        @Deprecated
         public String getMavenHome() {
             return getHome();
         }
 
         public File getHomeDir() {
             return new File(getHome());
+        }
+
+        @Override
+        public void buildEnvVars(EnvVars env) {
+            String home = getHome();
+            if (home == null) {
+                return;
+            }
+            env.put("M2_HOME", home);
+            env.put("MAVEN_HOME", home);
+            env.put("PATH+MAVEN", home + "/bin");
         }
 
         /**
@@ -412,7 +513,7 @@ public class Maven extends Builder {
         public boolean meetsMavenReqVersion(Launcher launcher, int mavenReqVersion) throws IOException, InterruptedException {
             // FIXME using similar stuff as in the maven plugin could be better 
             // olamy : but will add a dependency on maven in core -> so not so good 
-            String mavenVersion = launcher.getChannel().call(new Callable<String,IOException>() {
+            String mavenVersion = launcher.getChannel().call(new MasterToSlaveCallable<String,IOException>() {
                     private static final long serialVersionUID = -4143159957567745621L;
 
                     public String call() throws IOException {
@@ -468,7 +569,7 @@ public class Maven extends Builder {
          * Gets the executable path of this maven on the given target system.
          */
         public String getExecutable(Launcher launcher) throws IOException, InterruptedException {
-            return launcher.getChannel().call(new Callable<String,IOException>() {
+            return launcher.getChannel().call(new MasterToSlaveCallable<String,IOException>() {
                 private static final long serialVersionUID = 2373163112639943768L;
 
                 public String call() throws IOException {
@@ -484,12 +585,20 @@ public class Maven extends Builder {
         }
 
         private File getExeFile(String execName) {
-            if(File.separatorChar=='\\')
-                execName += ".bat";
-
             String m2Home = Util.replaceMacro(getHome(),EnvVars.masterEnvVars);
 
-            return new File(m2Home, "bin/" + execName);
+            if(Functions.isWindows()) {
+                File exeFile = new File(m2Home, "bin/" + execName + ".bat");
+
+                // since Maven 3.3 .bat files are replaced with .cmd
+                if (!exeFile.exists()) {
+                    return new File(m2Home, "bin/" + execName + ".cmd");
+                }
+
+                return exeFile;
+            } else {
+                return new File(m2Home, "bin/" + execName);
+            }
         }
 
         /**
@@ -544,17 +653,7 @@ public class Maven extends Builder {
             /**
              * Checks if the MAVEN_HOME is valid.
              */
-            public FormValidation doCheckMavenHome(@QueryParameter File value) {
-                // this can be used to check the existence of a file on the server, so needs to be protected
-                if(!Jenkins.getInstance().hasPermission(Jenkins.ADMINISTER))
-                    return FormValidation.ok();
-
-                if(value.getPath().equals(""))
-                    return FormValidation.ok();
-
-                if(!value.isDirectory())
-                    return FormValidation.error(Messages.Maven_NotADirectory(value));
-
+            @Override protected FormValidation checkHomeDirectory(File value) {
                 File maven1File = new File(value,MAVEN_1_INSTALLATION_COMMON_FILE);
                 File maven2File = new File(value,MAVEN_2_INSTALLATION_COMMON_FILE);
 
@@ -564,9 +663,6 @@ public class Maven extends Builder {
                 return FormValidation.ok();
             }
 
-            public FormValidation doCheckName(@QueryParameter String value) {
-                return FormValidation.validateRequired(value);
-            }
         }
 
         public static class ConverterImpl extends ToolConverter {

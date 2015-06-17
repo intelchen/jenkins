@@ -26,7 +26,6 @@ package hudson.cli;
 import hudson.Extension;
 import hudson.FilePath;
 import hudson.PluginManager;
-import hudson.util.IOException2;
 import jenkins.model.Jenkins;
 import hudson.model.UpdateSite;
 import hudson.model.UpdateSite.Data;
@@ -35,6 +34,7 @@ import org.kohsuke.args4j.Argument;
 import org.kohsuke.args4j.Option;
 
 import java.io.File;
+import java.io.IOException;
 import java.net.URL;
 import java.net.MalformedURLException;
 import java.util.HashSet;
@@ -71,7 +71,7 @@ public class InstallPluginCommand extends CLICommand {
 
     protected int run() throws Exception {
         Jenkins h = Jenkins.getInstance();
-        h.checkPermission(Jenkins.ADMINISTER);
+        h.checkPermission(PluginManager.UPLOAD_PLUGINS);
         PluginManager pm = h.getPluginManager();
 
         for (String source : sources) {
@@ -95,8 +95,8 @@ public class InstallPluginCommand extends CLICommand {
                 stdout.println(Messages.InstallPluginCommand_InstallingPluginFromUrl(u));
                 if (name==null) {
                     name = u.getPath();
-                    name = name.substring(name.indexOf('/')+1);
-                    name = name.substring(name.indexOf('\\')+1);
+                    name = name.substring(name.lastIndexOf('/')+1);
+                    name = name.substring(name.lastIndexOf('\\')+1);
                     int idx = name.lastIndexOf('.');
                     if (idx>0)  name = name.substring(0,idx);
                 }
@@ -114,7 +114,7 @@ public class InstallPluginCommand extends CLICommand {
                 stdout.println(Messages.InstallPluginCommand_InstallingFromUpdateCenter(source));
                 Throwable e = p.deploy(dynamicLoad).get().getError();
                 if (e!=null)
-                    throw new IOException2("Failed to install plugin "+source,e);
+                    throw new IOException("Failed to install plugin "+source,e);
                 continue;
             }
 
@@ -141,7 +141,7 @@ public class InstallPluginCommand extends CLICommand {
         }
 
         if (restart)
-            h.restart();
+            h.safeRestart();
         return 0; // all success
     }
 

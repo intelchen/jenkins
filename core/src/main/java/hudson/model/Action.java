@@ -24,7 +24,6 @@
 package hudson.model;
 
 import hudson.Functions;
-import hudson.tasks.test.TestResultProjectAction;
 
 /**
  * Object that contributes additional information, behaviors, and UIs to {@link ModelObject}
@@ -46,7 +45,7 @@ import hudson.tasks.test.TestResultProjectAction;
  * it will be displayed as a floating box on the top page of
  * the target {@link ModelObject}. (For example, this is how
  * the JUnit test result trend shows up in the project top page.
- * See {@link TestResultProjectAction}.
+ * See {@code TestResultProjectAction}.)
  *
  * <p>
  * On the target {@link ModelObject} page, actions are rendered as an item in the side panel
@@ -56,8 +55,8 @@ import hudson.tasks.test.TestResultProjectAction;
  * Jenkins show the option to wipe out the workspace inside the workspace link:
  *
  * <pre>
- * &lt;l:task icon="images/24x24/folder.gif"  href="${url}/ws/" title="${%Workspace}">
- *   &lt;l:task icon="images/24x24/folder-delete.gif"  href="${url}/wipeOutWorkspace" title="${%Wipe Out Workspace}" />
+ * &lt;l:task icon="icon-folder icon-md"  href="${url}/ws/" title="${%Workspace}">
+ *   &lt;l:task icon="icon-delete icon-md"  href="${url}/wipeOutWorkspace" title="${%Wipe Out Workspace}" />
  * &lt;/l:task>
  * </pre>
  *
@@ -89,6 +88,7 @@ public interface Action extends ModelObject {
      *      and no task list item. The other case where this is useful is
      *      to avoid showing links that require a privilege when the user is anonymous.
      * @see Functions#isAnonymous()
+     * @see Functions#getIconFilePath(Action)
      */
     String getIconFileName();
 
@@ -122,6 +122,7 @@ public interface Action extends ModelObject {
      * @return
      *      null if this action object doesn't need to be bound to web
      *      (when you do that, be sure to also return null from {@link #getIconFileName()}.
+     * @see Functions#getActionUrl(String, Action)
      */
     String getUrlName();
 }
